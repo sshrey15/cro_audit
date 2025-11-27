@@ -138,14 +138,23 @@ export async function POST(request: Request) {
                 '--disable-features=site-per-process',
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage'
+                '--disable-dev-shm-usage',
+                '--disable-http2' // Disable HTTP/2 to avoid protocol errors with certain sites
             ]
         });
 
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport: { width: 1440, height: 900 },
-            extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' }
+            extraHTTPHeaders: { 
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Referer': 'https://www.google.com/'
+            }
         });
 
         const page = await context.newPage();
@@ -164,11 +173,118 @@ export async function POST(request: Request) {
 
         // === 1. Load Homepage ===
         await page.setViewportSize({ width: 1440, height: 900 });
-        await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        
+        // Load homepage with retry and fallback strategies for HTTP/2 or network errors
+        let homepageLoaded = false;
+        try {
+            await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            homepageLoaded = true;
+        } catch (err) {
+            console.log('Failed with domcontentloaded, trying networkidle...');
+            try {
+                await page.goto(baseUrl, { waitUntil: 'networkidle', timeout: 15000 });
+                homepageLoaded = true;
+            } catch (err2) {
+                console.log('Failed with networkidle, trying commit...');
+                try {
+                    await page.goto(baseUrl, { waitUntil: 'commit', timeout: 15000 });
+                    homepageLoaded = true;
+                } catch (err3) {
+                    console.log('All goto strategies failed, attempting reload...');
+                    try {
+                        // Try a soft reload or just wait and continue
+                        await page.evaluate(() => window.location.reload());
+                        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+                        homepageLoaded = true;
+                    } catch (err4) {
+                        console.error(`Unable to load ${baseUrl}:`, (err3 as any).message);
+                        return NextResponse.json(
+                            { error: `Failed to load website. The site may be blocking automated browser access (detected by robot-blocking middleware). Please try: 1) A different site, 2) Disabling any VPN/proxy, or 3) Using a residential IP. Site: ${baseUrl}` },
+                            { status: 400 }
+                        );
+                    }
+                }
+            }
+        }
+        
+        if (!homepageLoaded) {
+            return NextResponse.json(
+                { error: 'Failed to load homepage after retries.' },
+                { status: 400 }
+            );
+        }
+        
         await page.waitForTimeout(1500);
         await page.evaluate(removePopupsScript);
         await page.waitForTimeout(500);
         await page.evaluate(removePopupsScript);
+
+        // === Simulate Human-Like Behavior ===
+        // Scroll naturally through the page, hover over elements, wait for animations
+        await page.evaluate(async () => {
+            const randomDelay = (min: number, max: number) => 
+                new Promise(r => setTimeout(r, Math.random() * (max - min) + min));
+
+            // Natural scroll down with pauses
+            const scrollHeight = document.documentElement.scrollHeight;
+            const viewportHeight = window.innerHeight;
+            let currentScroll = 0;
+
+            // Scroll in multiple steps
+            for (let i = 0; i < 3; i++) {
+                currentScroll += viewportHeight * 0.6;
+                window.scrollBy(0, viewportHeight * 0.6);
+                // Random human-like delay between scrolls
+                await randomDelay(300, 800);
+
+                // Hover over visible elements
+                const elements = document.elementsFromPoint(
+                    window.innerWidth / 2,
+                    window.innerHeight / 2
+                );
+                for (const el of elements.slice(0, 3)) {
+                    (el as any).dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    await randomDelay(100, 300);
+                }
+            }
+
+            // Scroll back to top
+            window.scrollTo(0, 0);
+            await randomDelay(200, 400);
+
+            // Click interactive elements (buttons, dropdowns, filters)
+            const interactiveSelectors = [
+                'button',
+                'a[href*="filter"]',
+                'a[href*="category"]',
+                '[class*="filter"]',
+                '[class*="sort"]',
+                '[role="button"]'
+            ];
+
+            const clickableElements = Array.from(
+                document.querySelectorAll(interactiveSelectors.join(','))
+            ).filter(el => {
+                const rect = el.getBoundingClientRect();
+                const isVisible = rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight;
+                const isClickable = (el.tagName === 'BUTTON' || el.tagName === 'A');
+                return isVisible && isClickable;
+            });
+
+            // Interact with a couple of clickable elements (but don't actually click navigation)
+            for (const el of clickableElements.slice(0, 2)) {
+                const rect = el.getBoundingClientRect();
+                if (rect.top > -100 && rect.top < window.innerHeight) {
+                    // Just simulate hover interaction
+                    (el as HTMLElement).dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    (el as HTMLElement).dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                    await randomDelay(200, 500);
+                }
+            }
+
+            // Wait for any animations to complete
+            await new Promise(r => setTimeout(r, 500));
+        });
 
         // Trigger lazy loading
         await page.evaluate(async () => {
@@ -300,6 +416,82 @@ export async function POST(request: Request) {
             });
         }
 
+        // Classify site: detect if it's ecommerce and try to infer a niche
+        let classification: { isEcommerce: boolean; niche: string; scores?: Record<string, number> } = { isEcommerce: false, niche: 'unknown' };
+
+        try {
+            // Ensure we're on the homepage for site-level analysis
+            try { await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 10000 }); } catch (_) { /* ignore */ }
+
+            classification = await page.evaluate(({ productLinks, collectionLinks }) => {
+                const textParts: string[] = [];
+                const add = (s?: string | null) => { if (s) textParts.push(s.toString().toLowerCase()); };
+
+                add(document.title);
+                add(document.querySelector('meta[name="description"]')?.getAttribute('content'));
+                add(document.querySelector('meta[property="og:description"]')?.getAttribute('content'));
+                add(document.querySelector('meta[name="keywords"]')?.getAttribute('content'));
+
+                Array.from(document.querySelectorAll('h1,h2,h3')).forEach(h => add(h.textContent));
+                Array.from(document.querySelectorAll('[class*="breadcrumb" i], [class*="category" i], [class*="tag" i]')).forEach(e => add(e.textContent));
+
+                // Add product & collection names discovered
+                (productLinks || []).forEach(p => add(p.name));
+                (collectionLinks || []).forEach(c => add(c.name));
+
+                // Include JSON-LD content
+                Array.from(document.querySelectorAll('script[type="application/ld+json"]')).forEach(s => add(s.textContent));
+
+                const bodyText = textParts.join(' ');
+
+                // Heuristics for ecommerce detection
+                let isEcommerce = false;
+                if ((productLinks || []).length > 0) isEcommerce = true;
+                if (!isEcommerce) {
+                    if (bodyText.match(/\b(add to cart|add to bag|buy now|checkout|shopping cart|add to basket|price|out of stock|sku|product details)\b/)) isEcommerce = true;
+                    if (document.querySelector('[class*="add-to-cart" i], [id*="add-to-cart" i], a[href*="/cart"], a[href*="/checkout"]')) isEcommerce = true;
+                    if (bodyText.includes('"@type":"product"') || bodyText.includes('"@type":"offer"') || bodyText.includes('"@type":"aggregateoffer"')) isEcommerce = true;
+                }
+
+                // Niche inference via keyword mapping
+                const nicheMap: Record<string, string[]> = {
+                    fashion: ['shirt','dress','jeans','apparel','clothing','shoe','sneaker','hat','bag','jacket','sweater','hoodie','skirt','trouser'],
+                    electronics: ['phone','laptop','charger','headphone','camera','tv','speaker','tablet','smartwatch','earbuds','charger','monitor'],
+                    beauty: ['makeup','skincare','cream','serum','fragrance','perfume','cosmetic','lipstick','mascara','moisturizer','cleanser'],
+                    home: ['furniture','sofa','mattress','kitchen','cookware','bedding','decor','home','lamp','table','chair','cabinet'],
+                    food: ['coffee','tea','grocery','snack','organic','food','beverage','chocolate','wine','beer','bakery'],
+                    sports: ['bike','bicycle','fitness','gym','yoga','running','sport','ball','treadmill','outdoor','camping','hiking'],
+                    kids: ['baby','toddler','stroller','diaper','kids','toy','children','crib','car seat'],
+                    pet: ['pet','dog','cat','pet food','leash','collar','aquarium'],
+                    jewelry: ['ring','necklace','jewel','bracelet','earring','gemstone'],
+                    health: ['supplement','vitamin','wellness','health','thermometer','pill','pharmacy']
+                };
+
+                const scores: Record<string, number> = {};
+                Object.keys(nicheMap).forEach(k => scores[k] = 0);
+
+                Object.entries(nicheMap).forEach(([niche, keywords]) => {
+                    for (const kw of keywords) {
+                        const re = new RegExp(`\\b${kw.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\b`, 'i');
+                        if (bodyText.match(re)) scores[niche] += 1;
+                    }
+                });
+
+                // Also check product/collection names
+                (productLinks || []).forEach(p => Object.keys(nicheMap).forEach(n => {
+                    nicheMap[n].forEach(kw => { if ((p.name||'').toLowerCase().includes(kw)) scores[n] += 2; });
+                }));
+
+                // Pick top niche
+                const top = Object.entries(scores).sort((a,b) => b[1]-a[1])[0];
+                const inferred = top && top[1] > 0 ? top[0] : (bodyText.includes('store') || bodyText.includes('shop') ? 'general-retail' : 'unknown');
+
+                return { isEcommerce, niche: inferred, scores };
+            }, { productLinks, collectionLinks });
+        } catch (classifyError) {
+            console.log('Classification error:', classifyError);
+        }
+
         console.log(`Targets: ${targets.map(t => `${t.key} (${t.type})`).join(', ')}`);
 
         // === 5. Take Screenshots for Each Target ===
@@ -310,7 +502,29 @@ export async function POST(request: Request) {
 
             // --- Desktop ---
             await page.setViewportSize({ width: 1440, height: desktopHeight });
-            await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            
+            // Try to load target page with retry strategies
+            let targetLoaded = false;
+            try {
+                await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                targetLoaded = true;
+            } catch (err) {
+                try {
+                    await page.goto(target.url, { waitUntil: 'networkidle', timeout: 15000 });
+                    targetLoaded = true;
+                } catch (err2) {
+                    try {
+                        await page.goto(target.url, { waitUntil: 'commit', timeout: 15000 });
+                        targetLoaded = true;
+                    } catch (err3) {
+                        console.error(`Failed to load target ${target.key} (${target.url}):`, (err3 as any).message);
+                        continue; // Skip this target if loading fails
+                    }
+                }
+            }
+            
+            if (!targetLoaded) continue;
+            
             await page.waitForTimeout(1500);
             await page.evaluate(removePopupsScript);
             await page.waitForTimeout(500);
@@ -346,10 +560,18 @@ export async function POST(request: Request) {
                 }
             }, target.type);
 
-            const foldCount = target.type === 'homepage' ? 3 : 2;
+            // For homepage: take full-page screenshot; for product/collection: take fold-based screenshots
+            const isFullPageCapture = target.type === 'homepage';
+            const foldCount = isFullPageCapture ? 1 : 2;
 
             for (let fold = 1; fold <= foldCount; fold++) {
-                if (fold > 1) {
+                // Scroll to top before each screenshot for product pages (especially navbar)
+                if (target.type === 'product') {
+                    await page.evaluate(() => window.scrollTo(0, 0));
+                    await page.waitForTimeout(400);
+                }
+                
+                if (fold > 1 && !isFullPageCapture) {
                     await page.evaluate(({ h, f }: { h: number; f: number }) => window.scrollTo(0, h * (f - 1)), { h: desktopHeight, f: fold });
                     await page.waitForTimeout(500);
                     await page.evaluate(removePopupsScript);
@@ -371,9 +593,87 @@ export async function POST(request: Request) {
                     }, target.type);
                 }
 
+                // Simulate human behavior: hover and interact with visible elements in this fold
+                await page.evaluate(async () => {
+                    const randomDelay = (min: number, max: number) => 
+                        new Promise(r => setTimeout(r, Math.random() * (max - min) + min));
+
+                    // Hover over visible product cards or interactive elements
+                    const productSelectors = [
+                        '[class*="product"]',
+                        '[class*="card"]',
+                        'button',
+                        '[role="button"]'
+                    ];
+
+                    const visibleElements = Array.from(
+                        document.querySelectorAll(productSelectors.join(','))
+                    ).filter(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0 && 
+                               rect.top < window.innerHeight && rect.bottom > 0;
+                    });
+
+                    // Interact with 2-3 visible elements
+                    for (const el of visibleElements.slice(0, 3)) {
+                        (el as HTMLElement).dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                        (el as HTMLElement).dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                        await randomDelay(200, 500);
+                    }
+
+                    // Wait for hover effects and animations
+                    await new Promise(r => setTimeout(r, 300));
+                });
+
+                // Ensure images (especially on product pages) are loaded and visible before taking screenshot
+                await page.evaluate(async (pageType) => {
+                    const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
+                    const containerSelectors = pageType === 'product'
+                        ? ['.product-main', '.product-container', '.product-details', 'main']
+                        : ['main', 'body'];
+                    const container = document.querySelector(containerSelectors.find(s => document.querySelector(s)) || 'body') as HTMLElement;
+                    const imgs: HTMLImageElement[] = container ? Array.from(container.querySelectorAll('img')) : Array.from(document.images) as any;
+
+                    // Trigger lazy-load attributes
+                    imgs.forEach(img => {
+                        if (!img.src) {
+                            const ds = (img as any).dataset;
+                            if (ds && ds.src) img.src = ds.src;
+                            if (ds && ds.srcset) img.srcset = ds.srcset;
+                        }
+                    });
+
+                    for (const img of imgs) {
+                        try {
+                            // Scroll into view to force loading
+                            img.scrollIntoView({ block: 'center', inline: 'nearest' });
+                            // Wait for load or error (or already loaded)
+                            if (!img.complete || img.naturalWidth === 0) {
+                                await new Promise<void>(resolve => {
+                                    const onDone = () => { img.removeEventListener('load', onDone); img.removeEventListener('error', onDone); resolve(); };
+                                    img.addEventListener('load', onDone);
+                                    img.addEventListener('error', onDone);
+                                    // safeguard timeout
+                                    setTimeout(onDone, 4000);
+                                });
+                            }
+                            await wait(100);
+                        } catch (e) {
+                            // ignore individual image errors
+                        }
+                    }
+                    await wait(250);
+                }, target.type);
+
                 const fileName = `${target.key}-desktop-fold${fold}-${Date.now()}.png`;
                 const filePath = path.join(screenshotDir, fileName);
-                await page.screenshot({ path: filePath, type: 'png' });
+                
+                // Take full-page screenshot for homepage, or viewport screenshot for others
+                if (isFullPageCapture) {
+                    await page.screenshot({ path: filePath, type: 'png', fullPage: true });
+                } else {
+                    await page.screenshot({ path: filePath, type: 'png' });
+                }
                 screenshots[target.key].push(`/screenshot/${fileName}`);
 
                 // Remove highlight
@@ -388,7 +688,23 @@ export async function POST(request: Request) {
 
             // --- Mobile ---
             await page.setViewportSize({ width: 390, height: mobileHeight });
-            await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            
+            // Retry for mobile as well
+            try {
+                await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            } catch (err) {
+                try {
+                    await page.goto(target.url, { waitUntil: 'networkidle', timeout: 15000 });
+                } catch (err2) {
+                    try {
+                        await page.goto(target.url, { waitUntil: 'commit', timeout: 15000 });
+                    } catch (err3) {
+                        console.error(`Failed to load mobile for ${target.key}:`, (err3 as any).message);
+                        continue;
+                    }
+                }
+            }
+            
             await page.waitForTimeout(1500);
             await page.evaluate(removePopupsScript);
             await page.waitForTimeout(500);
@@ -445,9 +761,84 @@ export async function POST(request: Request) {
                     }, target.type);
                 }
 
+                // Simulate human behavior for mobile: hover and interact with visible elements in this fold
+                await page.evaluate(async () => {
+                    const randomDelay = (min: number, max: number) => 
+                        new Promise(r => setTimeout(r, Math.random() * (max - min) + min));
+
+                    // Hover over visible product cards or interactive elements
+                    const productSelectors = [
+                        '[class*="product"]',
+                        '[class*="card"]',
+                        'button',
+                        '[role="button"]'
+                    ];
+
+                    const visibleElements = Array.from(
+                        document.querySelectorAll(productSelectors.join(','))
+                    ).filter(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0 && 
+                               rect.top < window.innerHeight && rect.bottom > 0;
+                    });
+
+                    // Interact with 2-3 visible elements
+                    for (const el of visibleElements.slice(0, 3)) {
+                        (el as HTMLElement).dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                        (el as HTMLElement).dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+                        await randomDelay(200, 500);
+                    }
+
+                    // Wait for hover effects and animations
+                    await new Promise(r => setTimeout(r, 300));
+                });
+
+                // Ensure images (especially on product pages) are loaded and visible before taking mobile screenshot
+                await page.evaluate(async (pageType) => {
+                    const wait = (ms: number) => new Promise(res => setTimeout(res, ms));
+                    const containerSelectors = pageType === 'product'
+                        ? ['.product-main', '.product-container', '.product-details', 'main']
+                        : ['main', 'body'];
+                    const container = document.querySelector(containerSelectors.find(s => document.querySelector(s)) || 'body') as HTMLElement;
+                    const imgs: HTMLImageElement[] = container ? Array.from(container.querySelectorAll('img')) : Array.from(document.images) as any;
+
+                    // Trigger lazy-load attributes
+                    imgs.forEach(img => {
+                        if (!img.src) {
+                            const ds = (img as any).dataset;
+                            if (ds && ds.src) img.src = ds.src;
+                            if (ds && ds.srcset) img.srcset = ds.srcset;
+                        }
+                    });
+
+                    for (const img of imgs) {
+                        try {
+                            img.scrollIntoView({ block: 'center', inline: 'nearest' });
+                            if (!img.complete || img.naturalWidth === 0) {
+                                await new Promise<void>(resolve => {
+                                    const onDone = () => { img.removeEventListener('load', onDone); img.removeEventListener('error', onDone); resolve(); };
+                                    img.addEventListener('load', onDone);
+                                    img.addEventListener('error', onDone);
+                                    setTimeout(onDone, 4000);
+                                });
+                            }
+                            await wait(100);
+                        } catch (e) {
+                            // ignore
+                        }
+                    }
+                    await wait(250);
+                }, target.type);
+
                 const fileName = `${target.key}-mobile-fold${fold}-${Date.now()}.png`;
                 const filePath = path.join(screenshotDir, fileName);
-                await page.screenshot({ path: filePath, type: 'png' });
+                
+                // Take full-page screenshot for homepage, or viewport screenshot for others
+                if (isFullPageCapture) {
+                    await page.screenshot({ path: filePath, type: 'png', fullPage: true });
+                } else {
+                    await page.screenshot({ path: filePath, type: 'png' });
+                }
                 screenshots[target.key].push(`/screenshot/${fileName}`);
 
                 await page.evaluate(() => {
@@ -460,7 +851,7 @@ export async function POST(request: Request) {
             }
         }
 
-        return NextResponse.json(screenshots, { status: 200 });
+    return NextResponse.json({ screenshots, classification }, { status: 200 });
 
     } catch (e: any) {
         console.error('Screenshot error:', e);
